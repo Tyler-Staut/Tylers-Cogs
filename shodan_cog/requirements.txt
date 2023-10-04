@@ -42,7 +42,7 @@ shodan==1.27.0
     # via -r requirements.in
 typing-extensions==4.1.1
     # via aiohttp
-urllib3==1.26.9
+urllib3==1.26.17
     # via requests
 xlsxwriter==3.0.3
     # via shodan
