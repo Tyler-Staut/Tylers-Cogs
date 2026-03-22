@@ -13,12 +13,10 @@ In a guild (admin):  commands set per-guild overrides. Guild settings take
 """
 
 import asyncio
-import base64
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-import aiohttp
 import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
@@ -214,30 +212,6 @@ class LLMChat(commands.Cog):
                 else:
                     await message.channel.send(chunk)
 
-    async def _fetch_image_b64(self, url: str) -> Optional[tuple[str, str]]:
-        """Fetch an image from a URL and return (base64_data, media_type), or None on failure."""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    url, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
-                        return None
-                    content_type = resp.content_type or "image/png"
-                    # Normalise to a supported MIME type
-                    if content_type not in (
-                        "image/jpeg",
-                        "image/png",
-                        "image/gif",
-                        "image/webp",
-                    ):
-                        content_type = "image/png"
-                    data = await resp.read()
-                    return base64.b64encode(data).decode("utf-8"), content_type
-        except Exception:
-            log.warning("Failed to fetch image attachment", exc_info=True)
-            return None
-
     async def _build_messages(
         self,
         trigger_message: discord.Message,
@@ -270,7 +244,9 @@ class LLMChat(commands.Cog):
                 if content:
                     messages.append({"role": role, "content": content})
 
-        # Build the final user message — may include images
+        # Build the final user message — pass image URLs directly (no base64 encoding).
+        # The OpenAI-compatible image_url format is supported by Ollama (llava, etc.),
+        # OpenAI, and OpenRouter without any extra processing.
         image_attachments = [
             a
             for a in trigger_message.attachments
@@ -278,31 +254,19 @@ class LLMChat(commands.Cog):
         ]
 
         if image_attachments:
-            # Vision content block: text + one or more images
-            content_parts = [
+            content_parts: list = [
                 {
                     "type": "text",
                     "text": f"{trigger_message.author.display_name}: {user_text}",
                 }
             ]
             for attachment in image_attachments:
-                result = await self._fetch_image_b64(attachment.url)
-                if result:
-                    b64_data, media_type = result
-                    content_parts.append(
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:{media_type};base64,{b64_data}"
-                            },
-                        }
-                    )
-                else:
-                    # Fallback: tell the model a image was attached but couldn't be loaded
-                    content_parts[0][
-                        "text"
-                    ] += f"\n[Image attached: {attachment.filename} — could not be loaded]"
-
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": attachment.url},
+                    }
+                )
             messages.append({"role": "user", "content": content_parts})
         else:
             messages.append(
@@ -356,7 +320,7 @@ class LLMChat(commands.Cog):
         """
         await ctx.send_help()
 
-    # --- enable / disable / channels (guild-only, these don't make sense globally) ---
+    # --- enable / disable / channels (guild-only) ---
 
     @llmchat.command(name="enable")
     async def llmchat_enable(
@@ -410,8 +374,7 @@ class LLMChat(commands.Cog):
             mentions.append(ch.mention if ch else f"<deleted channel {cid}>")
         await ctx.send(f"**Enabled channels:** {', '.join(mentions)}")
 
-    # --- model / baseurl / apikey / systemprompt / maxtokens / context
-    #     These work in DMs (sets global) or in a guild (sets per-guild override) ---
+    # --- model / baseurl / apikey / systemprompt / maxtokens / context ---
 
     @llmchat.command(name="model")
     async def llmchat_model(self, ctx: commands.Context, *, model: str):
@@ -422,9 +385,9 @@ class LLMChat(commands.Cog):
         In DMs (owner): sets the global default for all guilds.
 
         Examples:
-          `[p]llmchat model llama3`               <- Ollama
-          `[p]llmchat model mistral`               <- Ollama
-          `[p]llmchat model gpt-4o`                <- OpenAI
+          `[p]llmchat model llava`                <- Ollama (vision-capable)
+          `[p]llmchat model llama3`               <- Ollama (text only)
+          `[p]llmchat model gpt-4o`               <- OpenAI (vision + text)
           `[p]llmchat model mixtral-8x7b-instruct` <- OpenRouter
         """
         if not await self._check_dm_owner(ctx):
@@ -484,7 +447,6 @@ class LLMChat(commands.Cog):
         if not await self._check_guild_admin(ctx):
             return
 
-        # Try to delete the message to protect the key (won't work in DMs, that's fine)
         try:
             await ctx.message.delete()
         except (discord.Forbidden, discord.HTTPException):
@@ -576,7 +538,7 @@ class LLMChat(commands.Cog):
         """
         Show current LLMChat settings.
 
-        In a server: shows guild settings and the effective values (with global fallback).
+        In a server: shows guild settings and effective values (with global fallback).
         In DMs (owner): shows global defaults.
         """
         if not await self._check_dm_owner(ctx):
@@ -683,11 +645,13 @@ class LLMChat(commands.Cog):
             "**Step 1 — install openai into the bot venv (once, on the host):**\n"
             "```\n/data/venv/bin/pip install openai --no-deps\n```\n"
             "**Step 2 — set your backend (in DMs = global default, in server = guild override):**\n"
-            f"```\n{p}llmchat model llama3\n"
+            f"```\n{p}llmchat model llava\n"
             f"{p}llmchat baseurl http://localhost:11434/v1\n"
             f"{p}llmchat apikey ollama\n```\n"
             "**Step 3 — enable in a channel (must be in the server):**\n"
             f"```\n{p}llmchat enable #your-channel\n```\n"
+            "**Vision/image support:** use a vision-capable model such as `llava` (Ollama) or `gpt-4o` (OpenAI).\n"
+            "Text-only models like `llama3` will error if an image is sent.\n\n"
             "**Other backends:**\n"
             f"OpenAI:     `{p}llmchat baseurl https://api.openai.com/v1`\n"
             f"OpenRouter: `{p}llmchat baseurl https://openrouter.ai/api/v1`\n\n"
