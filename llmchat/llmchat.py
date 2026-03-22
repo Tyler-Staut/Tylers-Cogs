@@ -6,6 +6,10 @@ Uses the lightweight `openai` Python package, which works with:
   - OpenAI             base_url = (default),                  api_key = sk-...
   - OpenRouter         base_url = https://openrouter.ai/api/v1, api_key = sk-or-...
   - Any OpenAI-compatible endpoint (LM Studio, vLLM, etc.)
+
+In DMs (owner only): commands set global defaults applied to all guilds.
+In a guild (admin):  commands set per-guild overrides. Guild settings take
+                     priority; anything not set falls back to the global default.
 """
 
 import asyncio
@@ -36,7 +40,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are replying to a Discord message, so keep responses reasonably short unless detail is needed."
 )
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
-DEFAULT_API_KEY = "ollama"  # Ollama requires any non-empty string
+DEFAULT_API_KEY = "ollama"
 
 
 class LLMChat(commands.Cog):
@@ -44,6 +48,7 @@ class LLMChat(commands.Cog):
     AI chat via an OpenAI-compatible API. Responds to @mentions in enabled channels.
 
     Works with Ollama (local), OpenAI, OpenRouter, LM Studio, vLLM, and more.
+    Configure globally from DMs (owner) or per-guild in a server (admin).
     """
 
     def __init__(self, bot: Red):
@@ -52,8 +57,19 @@ class LLMChat(commands.Cog):
             self, identifier=0x4C4C4D434841, force_registration=True
         )
 
+        # Per-guild overrides — None means "use global default"
         self.config.register_guild(
             enabled_channels=[],
+            model=None,
+            system_prompt=None,
+            max_tokens=None,
+            context_messages=None,
+            base_url=None,
+            api_key=None,
+        )
+
+        # Global defaults — owner-configurable from DMs
+        self.config.register_global(
             model=DEFAULT_MODEL,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             max_tokens=DEFAULT_MAX_TOKENS,
@@ -71,12 +87,60 @@ class LLMChat(commands.Cog):
             )
 
     # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _get_effective_config(self, guild: discord.Guild) -> dict:
+        """Guild settings win; anything left as None falls back to global."""
+        g = await self.config.guild(guild).all()
+        glob = await self.config.all()
+        return {
+            "enabled_channels": g["enabled_channels"],
+            "model": g["model"] or glob["model"],
+            "system_prompt": g["system_prompt"] or glob["system_prompt"],
+            "max_tokens": (
+                g["max_tokens"] if g["max_tokens"] is not None else glob["max_tokens"]
+            ),
+            "context_messages": (
+                g["context_messages"]
+                if g["context_messages"] is not None
+                else glob["context_messages"]
+            ),
+            "base_url": g["base_url"] or glob["base_url"],
+            "api_key": g["api_key"] or glob["api_key"],
+        }
+
+    async def _is_owner(self, ctx: commands.Context) -> bool:
+        return await ctx.bot.is_owner(ctx.author)
+
+    async def _check_dm_owner(self, ctx: commands.Context) -> bool:
+        """In DMs, only the bot owner may run config commands."""
+        if ctx.guild is None and not await self._is_owner(ctx):
+            await ctx.send("Only the bot owner can configure LLMChat from DMs.")
+            return False
+        return True
+
+    async def _check_guild_admin(self, ctx: commands.Context) -> bool:
+        """In guilds, require admin or manage_guild."""
+        if ctx.guild is not None:
+            if not (
+                ctx.author.guild_permissions.administrator
+                or ctx.author.guild_permissions.manage_guild
+                or await self._is_owner(ctx)
+            ):
+                await ctx.send(
+                    "You need the Manage Server permission to configure LLMChat."
+                )
+                return False
+        return True
+
+    # ------------------------------------------------------------------
     # Listener
     # ------------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Only process @mentions in enabled channels."""
+        """Only process @mentions in enabled guild channels."""
         if not _OPENAI_AVAILABLE:
             return
         if message.author.bot:
@@ -100,7 +164,7 @@ class LLMChat(commands.Cog):
     # ------------------------------------------------------------------
 
     async def _handle_mention(self, message: discord.Message):
-        guild_config = await self.config.guild(message.guild).all()
+        cfg = await self._get_effective_config(message.guild)
 
         user_text = message.content
         for mention in [f"<@{self.bot.user.id}>", f"<@!{self.bot.user.id}>"]:
@@ -112,8 +176,8 @@ class LLMChat(commands.Cog):
         messages = await self._build_messages(
             message,
             user_text,
-            system_prompt=guild_config["system_prompt"],
-            context_limit=guild_config["context_messages"],
+            system_prompt=cfg["system_prompt"],
+            context_limit=cfg["context_messages"],
         )
 
         async with message.channel.typing():
@@ -121,10 +185,10 @@ class LLMChat(commands.Cog):
                 reply = await asyncio.wait_for(
                     self._call_openai(
                         messages=messages,
-                        model=guild_config["model"],
-                        max_tokens=guild_config["max_tokens"],
-                        base_url=guild_config["base_url"],
-                        api_key=guild_config["api_key"],
+                        model=cfg["model"],
+                        max_tokens=cfg["max_tokens"],
+                        base_url=cfg["base_url"],
+                        api_key=cfg["api_key"],
                     ),
                     timeout=120,
                 )
@@ -222,17 +286,26 @@ class LLMChat(commands.Cog):
     # ------------------------------------------------------------------
 
     @commands.group(name="llmchat", invoke_without_command=True)
-    @commands.guild_only()
     async def llmchat(self, ctx: commands.Context):
-        """LLMChat — AI responses via Ollama / OpenAI-compatible APIs."""
+        """
+        LLMChat — AI responses via Ollama / OpenAI-compatible APIs.
+
+        In a server (admin): sets per-guild config.
+        In DMs (owner only): sets global defaults for all guilds.
+        """
         await ctx.send_help()
 
+    # --- enable / disable / channels (guild-only, these don't make sense globally) ---
+
     @llmchat.command(name="enable")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_enable(
         self, ctx: commands.Context, channel: discord.TextChannel = None
     ):
-        """Enable LLMChat in a channel (defaults to current channel)."""
+        """Enable LLMChat in a channel. Must be run in a server."""
+        if ctx.guild is None:
+            return await ctx.send("This command must be run in a server, not DMs.")
+        if not await self._check_guild_admin(ctx):
+            return
         channel = channel or ctx.channel
         async with self.config.guild(ctx.guild).enabled_channels() as channels:
             if channel.id in channels:
@@ -240,16 +313,17 @@ class LLMChat(commands.Cog):
                     f"✅ LLMChat is already enabled in {channel.mention}."
                 )
             channels.append(channel.id)
-        await ctx.send(
-            f"✅ LLMChat enabled in {channel.mention}. The bot will now respond to @mentions there."
-        )
+        await ctx.send(f"✅ LLMChat enabled in {channel.mention}.")
 
     @llmchat.command(name="disable")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_disable(
         self, ctx: commands.Context, channel: discord.TextChannel = None
     ):
-        """Disable LLMChat in a channel (defaults to current channel)."""
+        """Disable LLMChat in a channel. Must be run in a server."""
+        if ctx.guild is None:
+            return await ctx.send("This command must be run in a server, not DMs.")
+        if not await self._check_guild_admin(ctx):
+            return
         channel = channel or ctx.channel
         async with self.config.guild(ctx.guild).enabled_channels() as channels:
             if channel.id not in channels:
@@ -258,9 +332,12 @@ class LLMChat(commands.Cog):
         await ctx.send(f"✅ LLMChat disabled in {channel.mention}.")
 
     @llmchat.command(name="channels")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_channels(self, ctx: commands.Context):
-        """List all channels where LLMChat is enabled."""
+        """List enabled channels. Must be run in a server."""
+        if ctx.guild is None:
+            return await ctx.send("This command must be run in a server, not DMs.")
+        if not await self._check_guild_admin(ctx):
+            return
         channel_ids = await self.config.guild(ctx.guild).enabled_channels()
         if not channel_ids:
             return await ctx.send(
@@ -272,11 +349,16 @@ class LLMChat(commands.Cog):
             mentions.append(ch.mention if ch else f"<deleted channel {cid}>")
         await ctx.send(f"**Enabled channels:** {', '.join(mentions)}")
 
+    # --- model / baseurl / apikey / systemprompt / maxtokens / context
+    #     These work in DMs (sets global) or in a guild (sets per-guild override) ---
+
     @llmchat.command(name="model")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_model(self, ctx: commands.Context, *, model: str):
         """
         Set the model name.
+
+        In a server: overrides the model for this guild only.
+        In DMs (owner): sets the global default for all guilds.
 
         Examples:
           `[p]llmchat model llama3`               <- Ollama
@@ -284,36 +366,64 @@ class LLMChat(commands.Cog):
           `[p]llmchat model gpt-4o`                <- OpenAI
           `[p]llmchat model mixtral-8x7b-instruct` <- OpenRouter
         """
-        await self.config.guild(ctx.guild).model.set(model)
-        await ctx.send(f"✅ Model set to `{model}`.")
+        if not await self._check_dm_owner(ctx):
+            return
+        if not await self._check_guild_admin(ctx):
+            return
+        if ctx.guild:
+            await self.config.guild(ctx.guild).model.set(model)
+            await ctx.send(f"✅ Model set to `{model}` for this server.")
+        else:
+            await self.config.model.set(model)
+            await ctx.send(f"✅ Global default model set to `{model}`.")
 
     @llmchat.command(name="baseurl")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_baseurl(self, ctx: commands.Context, url: str = None):
         """
         Set the API base URL.
 
-        Ollama (default): `[p]llmchat baseurl http://localhost:11434/v1`
-        OpenAI:           `[p]llmchat baseurl https://api.openai.com/v1`
-        OpenRouter:       `[p]llmchat baseurl https://openrouter.ai/api/v1`
-        Clear:            `[p]llmchat baseurl clear`
+        In a server: overrides for this guild only.
+        In DMs (owner): sets the global default.
+
+        Ollama:     `[p]llmchat baseurl http://localhost:11434/v1`
+        OpenAI:     `[p]llmchat baseurl https://api.openai.com/v1`
+        OpenRouter: `[p]llmchat baseurl https://openrouter.ai/api/v1`
+        Clear:      `[p]llmchat baseurl clear`
         """
+        if not await self._check_dm_owner(ctx):
+            return
+        if not await self._check_guild_admin(ctx):
+            return
         if url and url.lower() == "clear":
             url = None
-        await self.config.guild(ctx.guild).base_url.set(url)
+        if ctx.guild:
+            await self.config.guild(ctx.guild).base_url.set(url)
+            scope = "for this server"
+        else:
+            await self.config.base_url.set(url or DEFAULT_BASE_URL)
+            scope = "globally"
         await ctx.send(
-            f"✅ Base URL set to `{url}`." if url else "✅ Base URL cleared."
+            f"✅ Base URL set to `{url}` {scope}."
+            if url
+            else f"✅ Base URL reset to default {scope}."
         )
 
     @llmchat.command(name="apikey")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_apikey(self, ctx: commands.Context, key: str = None):
         """
-        Set the API key. Run in a private channel to avoid exposing it.
+        Set the API key. Run in DMs to keep it private.
 
-        Ollama doesn't need a real key — any value works (default: "ollama").
+        In a server: overrides for this guild only.
+        In DMs (owner): sets the global default.
+
         To clear: `[p]llmchat apikey clear`
         """
+        if not await self._check_dm_owner(ctx):
+            return
+        if not await self._check_guild_admin(ctx):
+            return
+
+        # Try to delete the message to protect the key (won't work in DMs, that's fine)
         try:
             await ctx.message.delete()
         except (discord.Forbidden, discord.HTTPException):
@@ -322,106 +432,204 @@ class LLMChat(commands.Cog):
         if key and key.lower() == "clear":
             key = None
 
-        await self.config.guild(ctx.guild).api_key.set(key)
-        if key:
-            await ctx.send(
-                "✅ API key saved. (Your message was deleted to protect the key.)"
-            )
+        if ctx.guild:
+            await self.config.guild(ctx.guild).api_key.set(key)
+            scope = "for this server"
         else:
-            await ctx.send("✅ API key cleared.")
+            await self.config.api_key.set(key or DEFAULT_API_KEY)
+            scope = "globally"
+
+        if key:
+            await ctx.send(f"✅ API key saved {scope}.")
+        else:
+            await ctx.send(f"✅ API key cleared {scope}.")
 
     @llmchat.command(name="systemprompt")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_systemprompt(self, ctx: commands.Context, *, prompt: str):
-        """Set the system prompt used for all conversations."""
-        await self.config.guild(ctx.guild).system_prompt.set(prompt)
-        await ctx.send(f"✅ System prompt updated:\n{box(prompt)}")
+        """
+        Set the system prompt.
+
+        In a server: overrides for this guild only.
+        In DMs (owner): sets the global default.
+        """
+        if not await self._check_dm_owner(ctx):
+            return
+        if not await self._check_guild_admin(ctx):
+            return
+        if ctx.guild:
+            await self.config.guild(ctx.guild).system_prompt.set(prompt)
+            scope = "for this server"
+        else:
+            await self.config.system_prompt.set(prompt)
+            scope = "globally"
+        await ctx.send(f"✅ System prompt updated {scope}:\n{box(prompt)}")
 
     @llmchat.command(name="maxtokens")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_maxtokens(self, ctx: commands.Context, tokens: int):
-        """Set max response tokens (default: 1024, range: 64-8192)."""
+        """
+        Set max response tokens (range: 64-8192).
+
+        In a server: overrides for this guild only.
+        In DMs (owner): sets the global default.
+        """
+        if not await self._check_dm_owner(ctx):
+            return
+        if not await self._check_guild_admin(ctx):
+            return
         if tokens < 64 or tokens > 8192:
             return await ctx.send("Please choose a value between 64 and 8192.")
-        await self.config.guild(ctx.guild).max_tokens.set(tokens)
-        await ctx.send(f"✅ Max tokens set to `{tokens}`.")
+        if ctx.guild:
+            await self.config.guild(ctx.guild).max_tokens.set(tokens)
+            scope = "for this server"
+        else:
+            await self.config.max_tokens.set(tokens)
+            scope = "globally"
+        await ctx.send(f"✅ Max tokens set to `{tokens}` {scope}.")
 
     @llmchat.command(name="context")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_context(self, ctx: commands.Context, count: int):
-        """Set how many recent messages to include as context (default: 10, max: 50, 0 = off)."""
+        """
+        Set how many recent messages to include as context (0-50).
+
+        In a server: overrides for this guild only.
+        In DMs (owner): sets the global default.
+        """
+        if not await self._check_dm_owner(ctx):
+            return
+        if not await self._check_guild_admin(ctx):
+            return
         if count < 0 or count > 50:
             return await ctx.send("Please choose a value between 0 and 50.")
-        await self.config.guild(ctx.guild).context_messages.set(count)
-        await ctx.send(f"✅ Context window set to `{count}` messages.")
+        if ctx.guild:
+            await self.config.guild(ctx.guild).context_messages.set(count)
+            scope = "for this server"
+        else:
+            await self.config.context_messages.set(count)
+            scope = "globally"
+        await ctx.send(f"✅ Context window set to `{count}` messages {scope}.")
+
+    # --- settings / setup ---
 
     @llmchat.command(name="settings")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_settings(self, ctx: commands.Context):
-        """Show current LLMChat settings."""
-        cfg = await self.config.guild(ctx.guild).all()
+        """
+        Show current LLMChat settings.
 
-        channel_list = []
-        for cid in cfg["enabled_channels"]:
-            ch = ctx.guild.get_channel(cid)
-            channel_list.append(ch.mention if ch else f"<deleted {cid}>")
+        In a server: shows guild settings and the effective values (with global fallback).
+        In DMs (owner): shows global defaults.
+        """
+        if not await self._check_dm_owner(ctx):
+            return
+        if not await self._check_guild_admin(ctx):
+            return
+
+        glob = await self.config.all()
 
         embed = discord.Embed(
             title="LLMChat Settings",
             color=await ctx.embed_color(),
             timestamp=datetime.now(timezone.utc),
         )
-        embed.add_field(name="Model", value=f"`{cfg['model']}`", inline=True)
-        embed.add_field(name="Max Tokens", value=str(cfg["max_tokens"]), inline=True)
-        embed.add_field(
-            name="Context Messages", value=str(cfg["context_messages"]), inline=True
-        )
-        embed.add_field(
-            name="Base URL",
-            value=f"`{cfg['base_url']}`" if cfg["base_url"] else "_default_",
-            inline=False,
-        )
-        embed.add_field(
-            name="API Key",
-            value="✅ Set" if cfg["api_key"] else "❌ Not set",
-            inline=True,
-        )
-        embed.add_field(
-            name="Enabled Channels",
-            value=", ".join(channel_list) if channel_list else "_None_",
-            inline=False,
-        )
-        embed.add_field(
-            name="System Prompt",
-            value=box(
-                cfg["system_prompt"][:500]
-                + ("..." if len(cfg["system_prompt"]) > 500 else "")
-            ),
-            inline=False,
-        )
+
+        if ctx.guild:
+            g = await self.config.guild(ctx.guild).all()
+            eff = await self._get_effective_config(ctx.guild)
+
+            channel_list = []
+            for cid in g["enabled_channels"]:
+                ch = ctx.guild.get_channel(cid)
+                channel_list.append(ch.mention if ch else f"<deleted {cid}>")
+
+            def fmt(guild_val, effective_val):
+                if guild_val is None:
+                    return f"`{effective_val}` _(global default)_"
+                return f"`{guild_val}`"
+
+            embed.description = "Showing guild overrides. Values marked _(global default)_ are inherited."
+            embed.add_field(
+                name="Model", value=fmt(g["model"], eff["model"]), inline=True
+            )
+            embed.add_field(
+                name="Max Tokens",
+                value=fmt(g["max_tokens"], eff["max_tokens"]),
+                inline=True,
+            )
+            embed.add_field(
+                name="Context Messages",
+                value=fmt(g["context_messages"], eff["context_messages"]),
+                inline=True,
+            )
+            embed.add_field(
+                name="Base URL", value=fmt(g["base_url"], eff["base_url"]), inline=False
+            )
+            embed.add_field(
+                name="API Key",
+                value=(
+                    "✅ Set (guild)"
+                    if g["api_key"]
+                    else ("✅ Set (global)" if glob["api_key"] else "❌ Not set")
+                ),
+                inline=True,
+            )
+            embed.add_field(
+                name="Enabled Channels",
+                value=", ".join(channel_list) if channel_list else "_None_",
+                inline=False,
+            )
+            sp = g["system_prompt"] or glob["system_prompt"]
+            sp_label = "System Prompt" + (
+                "" if g["system_prompt"] else " _(global default)_"
+            )
+            embed.add_field(
+                name=sp_label,
+                value=box(sp[:400] + ("..." if len(sp) > 400 else "")),
+                inline=False,
+            )
+        else:
+            embed.description = "Global defaults — applied to any guild that hasn't set its own override."
+            embed.add_field(name="Model", value=f"`{glob['model']}`", inline=True)
+            embed.add_field(
+                name="Max Tokens", value=str(glob["max_tokens"]), inline=True
+            )
+            embed.add_field(
+                name="Context Messages",
+                value=str(glob["context_messages"]),
+                inline=True,
+            )
+            embed.add_field(
+                name="Base URL", value=f"`{glob['base_url']}`", inline=False
+            )
+            embed.add_field(
+                name="API Key",
+                value="✅ Set" if glob["api_key"] else "❌ Not set",
+                inline=True,
+            )
+            sp = glob["system_prompt"]
+            embed.add_field(
+                name="System Prompt",
+                value=box(sp[:400] + ("..." if len(sp) > 400 else "")),
+                inline=False,
+            )
+
         await ctx.send(embed=embed)
 
     @llmchat.command(name="setup")
-    @commands.admin_or_permissions(manage_guild=True)
     async def llmchat_setup(self, ctx: commands.Context):
-        """Quick-start guide."""
+        """Quick-start guide. Works in DMs and in servers."""
+        p = ctx.prefix
         guide = (
             "**LLMChat Quick Setup**\n\n"
-            "**For local Ollama:**\n"
-            f"```\n{ctx.prefix}llmchat model llama3\n"
-            f"{ctx.prefix}llmchat baseurl http://localhost:11434/v1\n"
-            f"{ctx.prefix}llmchat apikey ollama\n"
-            f"{ctx.prefix}llmchat enable #your-channel\n```\n"
-            "**For OpenAI:**\n"
-            f"```\n{ctx.prefix}llmchat model gpt-4o\n"
-            f"{ctx.prefix}llmchat baseurl https://api.openai.com/v1\n"
-            f"{ctx.prefix}llmchat apikey sk-YOUR_KEY\n"
-            f"{ctx.prefix}llmchat enable #your-channel\n```\n"
-            "**For OpenRouter:**\n"
-            f"```\n{ctx.prefix}llmchat model mixtral-8x7b-instruct\n"
-            f"{ctx.prefix}llmchat baseurl https://openrouter.ai/api/v1\n"
-            f"{ctx.prefix}llmchat apikey sk-or-YOUR_KEY\n"
-            f"{ctx.prefix}llmchat enable #your-channel\n```\n"
-            f"See all settings: `{ctx.prefix}llmchat settings`"
+            "**Step 1 — install openai into the bot venv (once, on the host):**\n"
+            "```\n/data/venv/bin/pip install openai --no-deps\n```\n"
+            "**Step 2 — set your backend (in DMs = global default, in server = guild override):**\n"
+            f"```\n{p}llmchat model llama3\n"
+            f"{p}llmchat baseurl http://localhost:11434/v1\n"
+            f"{p}llmchat apikey ollama\n```\n"
+            "**Step 3 — enable in a channel (must be in the server):**\n"
+            f"```\n{p}llmchat enable #your-channel\n```\n"
+            "**Other backends:**\n"
+            f"OpenAI:     `{p}llmchat baseurl https://api.openai.com/v1`\n"
+            f"OpenRouter: `{p}llmchat baseurl https://openrouter.ai/api/v1`\n\n"
+            f"See settings: `{p}llmchat settings`"
         )
         await ctx.send(guide)
