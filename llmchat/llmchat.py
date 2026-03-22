@@ -13,10 +13,12 @@ In a guild (admin):  commands set per-guild overrides. Guild settings take
 """
 
 import asyncio
+import base64
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+import aiohttp
 import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
@@ -212,6 +214,30 @@ class LLMChat(commands.Cog):
                 else:
                     await message.channel.send(chunk)
 
+    async def _fetch_image_b64(self, url: str) -> Optional[tuple[str, str]]:
+        """Fetch an image from a URL and return (base64_data, media_type), or None on failure."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    content_type = resp.content_type or "image/png"
+                    # Normalise to a supported MIME type
+                    if content_type not in (
+                        "image/jpeg",
+                        "image/png",
+                        "image/gif",
+                        "image/webp",
+                    ):
+                        content_type = "image/png"
+                    data = await resp.read()
+                    return base64.b64encode(data).decode("utf-8"), content_type
+        except Exception:
+            log.warning("Failed to fetch image attachment", exc_info=True)
+            return None
+
     async def _build_messages(
         self,
         trigger_message: discord.Message,
@@ -244,12 +270,47 @@ class LLMChat(commands.Cog):
                 if content:
                     messages.append({"role": role, "content": content})
 
-        messages.append(
-            {
-                "role": "user",
-                "content": f"{trigger_message.author.display_name}: {user_text}",
-            }
-        )
+        # Build the final user message — may include images
+        image_attachments = [
+            a
+            for a in trigger_message.attachments
+            if a.content_type and a.content_type.startswith("image/")
+        ]
+
+        if image_attachments:
+            # Vision content block: text + one or more images
+            content_parts = [
+                {
+                    "type": "text",
+                    "text": f"{trigger_message.author.display_name}: {user_text}",
+                }
+            ]
+            for attachment in image_attachments:
+                result = await self._fetch_image_b64(attachment.url)
+                if result:
+                    b64_data, media_type = result
+                    content_parts.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{b64_data}"
+                            },
+                        }
+                    )
+                else:
+                    # Fallback: tell the model a image was attached but couldn't be loaded
+                    content_parts[0][
+                        "text"
+                    ] += f"\n[Image attached: {attachment.filename} — could not be loaded]"
+
+            messages.append({"role": "user", "content": content_parts})
+        else:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"{trigger_message.author.display_name}: {user_text}",
+                }
+            )
 
         return messages
 
