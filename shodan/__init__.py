@@ -1,4 +1,4 @@
-from .shodan import ApiTools
+from .shodan import shodan
 
 
 async def setup(bot):

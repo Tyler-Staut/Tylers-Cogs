@@ -1,4 +1,4 @@
-from .hybrid_analysis import ApiTools
+from .hybrid_analysis import hybrid_analysis
 
 
 async def setup(bot):
