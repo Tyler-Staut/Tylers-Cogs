@@ -2,17 +2,26 @@
 LLMChat — A Red-DiscordBot cog that responds to @mentions using the OpenAI-compatible API.
 
 Uses the lightweight `openai` Python package, which works with:
-  - Ollama (local)     base_url = http://localhost:11434/v1,  api_key = "ollama"
-  - OpenAI             base_url = (default),                  api_key = sk-...
-  - OpenRouter         base_url = https://openrouter.ai/api/v1, api_key = sk-or-...
-  - Any OpenAI-compatible endpoint (LM Studio, vLLM, etc.)
+- Ollama (local) base_url = http://localhost:11434/v1, api_key = "ollama"
+- OpenAI base_url = (default), api_key = sk-...
+- OpenRouter base_url = https://openrouter.ai/api/v1, api_key = sk-or-...
+- Any OpenAI-compatible endpoint (LM Studio, vLLM, etc.)
 
 In DMs (owner only): commands set global defaults applied to all guilds.
-In a guild (admin):  commands set per-guild overrides. Guild settings take
-                     priority; anything not set falls back to the global default.
+In a guild (admin): commands set per-guild overrides. Guild settings take
+priority; anything not set falls back to the global default.
+
+Smart history flow:
+  1. Classifier call decides if history would help.
+  2. If yes → bot sends an embed asking the user to confirm with Yes / No buttons.
+     - Yes      → fetch history, answer with it.
+     - No       → answer without history.
+     - 60s timeout → answer without history (buttons disabled, embed updated).
+  3. If classifier says no → answer immediately, no prompt.
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -41,7 +50,118 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
 DEFAULT_API_KEY = "ollama"
+HISTORY_PROMPT_TIMEOUT = 60  # seconds to wait for Yes/No before proceeding without history
 
+# ---------------------------------------------------------------------------
+# Classifier prompt — kept very short so it's cheap to run
+# ---------------------------------------------------------------------------
+_HISTORY_CLASSIFIER_PROMPT = """\
+You decide whether chat history is needed to answer a Discord message.
+
+Return ONLY valid JSON — no markdown fences, no extra text:
+{"needs_history": true, "reason": "one short sentence"}
+or
+{"needs_history": false, "reason": "one short sentence"}
+
+Return needs_history=true when the message:
+- Uses pronouns or references without a clear antecedent ("that", "it", "the one you mentioned")
+- Is a follow-up or continuation ("what about...", "and also...", "wait so...")
+- Asks about something said earlier ("what did you say about...", "earlier you mentioned...")
+- Is part of an ongoing task or multi-step question
+- Is ambiguous without context
+
+Return needs_history=false when the message:
+- Is a self-contained, standalone question or command
+- Introduces a new topic with no backwards reference
+- Is a greeting or simple acknowledgement
+- Is a factual question that makes sense without context
+"""
+
+
+# ---------------------------------------------------------------------------
+# Discord UI — Yes / No buttons
+# ---------------------------------------------------------------------------
+
+def _make_history_embed(
+    title: str,
+    description: str,
+    color: discord.Color,
+    show_footer: bool = True,
+) -> discord.Embed:
+    embed = discord.Embed(title=title, description=description, color=color)
+    if show_footer:
+        embed.set_footer(
+            text=f"No response within {HISTORY_PROMPT_TIMEOUT}s → I'll answer without history."
+        )
+    return embed
+
+
+class HistoryPromptView(discord.ui.View):
+    """
+    Embed + buttons asking whether to fetch message history.
+
+    Outcomes:
+      confirmed = True   → fetch history
+      confirmed = False  → skip history (user said No, or timed out)
+    """
+
+    def __init__(self, author: discord.Member):
+        super().__init__(timeout=HISTORY_PROMPT_TIMEOUT)
+        self.author = author
+        self.confirmed: Optional[bool] = None
+        self._event = asyncio.Event()
+
+    async def _resolve(self, interaction: discord.Interaction, confirmed: bool, embed: discord.Embed):
+        self.confirmed = confirmed
+        for child in self.children:
+            child.disabled = True
+        self._event.set()
+        self.stop()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def wait_for_response(self) -> bool:
+        """Block until the user clicks or the timeout fires. Returns True → use history."""
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=HISTORY_PROMPT_TIMEOUT)
+        except asyncio.TimeoutError:
+            self.confirmed = False
+            for child in self.children:
+                child.disabled = True
+            self.stop()
+        return bool(self.confirmed)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author.id:
+            await interaction.response.send_message(
+                "Only the person who asked can respond to this prompt.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, use history", style=discord.ButtonStyle.success, emoji="📜")
+    async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = _make_history_embed(
+            title="✅ Got it — fetching history",
+            description="Reading recent messages to give you a better answer…",
+            color=discord.Color.green(),
+            show_footer=False,
+        )
+        await self._resolve(interaction, confirmed=True, embed=embed)
+
+    @discord.ui.button(label="No, just answer", style=discord.ButtonStyle.danger, emoji="🚫")
+    async def no_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = _make_history_embed(
+            title="🚫 Skipping history",
+            description="Answering based only on your message.",
+            color=discord.Color.red(),
+            show_footer=False,
+        )
+        await self._resolve(interaction, confirmed=False, embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# Cog
+# ---------------------------------------------------------------------------
 
 class LLMChat(commands.Cog):
     """
@@ -49,6 +169,9 @@ class LLMChat(commands.Cog):
 
     Works with Ollama (local), OpenAI, OpenRouter, LM Studio, vLLM, and more.
     Configure globally from DMs (owner) or per-guild in a server (admin).
+
+    When a message seems to need conversation history the bot sends an embed
+    with Yes / No buttons. History is only fetched if the user confirms.
     """
 
     def __init__(self, bot: Red):
@@ -83,7 +206,7 @@ class LLMChat(commands.Cog):
             log.error(
                 "LLMChat: the `openai` package is not installed. "
                 "Run this in your bot's venv and then reload the cog:\n"
-                "  /data/venv/bin/pip install openai"
+                " /data/venv/bin/pip install openai"
             )
 
     # ------------------------------------------------------------------
@@ -114,14 +237,12 @@ class LLMChat(commands.Cog):
         return await ctx.bot.is_owner(ctx.author)
 
     async def _check_dm_owner(self, ctx: commands.Context) -> bool:
-        """In DMs, only the bot owner may run config commands."""
         if ctx.guild is None and not await self._is_owner(ctx):
             await ctx.send("Only the bot owner can configure LLMChat from DMs.")
             return False
         return True
 
     async def _check_guild_admin(self, ctx: commands.Context) -> bool:
-        """In guilds, require admin or manage_guild."""
         if ctx.guild is not None:
             if not (
                 ctx.author.guild_permissions.administrator
@@ -135,12 +256,70 @@ class LLMChat(commands.Cog):
         return True
 
     # ------------------------------------------------------------------
+    # Smart history classifier
+    # ------------------------------------------------------------------
+
+    async def _needs_history(
+        self,
+        user_text: str,
+        model: str,
+        base_url: Optional[str],
+        api_key: Optional[str],
+    ) -> tuple[bool, str]:
+        """
+        Ask the model whether message history would help answer `user_text`.
+
+        Returns (needs_history: bool, reason: str).
+        Falls back to (False, "") on any error.
+        """
+        if not _OPENAI_AVAILABLE:
+            return False, ""
+
+        try:
+            client = AsyncOpenAI(
+                base_url=base_url or None,
+                api_key=api_key or "none",
+            )
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": _HISTORY_CLASSIFIER_PROMPT},
+                        {
+                            "role": "user",
+                            "content": f'Discord message to classify:\n"{user_text}"',
+                        },
+                    ],
+                    max_tokens=60,
+                    temperature=0,  # deterministic
+                ),
+                timeout=15,
+            )
+            raw = response.choices[0].message.content.strip()
+
+            # Strip accidental markdown fences some models add
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            raw = raw.strip()
+
+            data = json.loads(raw)
+            needs = bool(data.get("needs_history", False))
+            reason = data.get("reason", "")
+            log.debug("History classifier: needs=%s — %s", needs, reason)
+            return needs, reason
+
+        except (asyncio.TimeoutError, json.JSONDecodeError, Exception) as exc:
+            log.debug("History classifier failed (%s), skipping history", exc)
+            return False, ""
+
+    # ------------------------------------------------------------------
     # Listener
     # ------------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        """Only process @mentions in enabled guild channels."""
         if not _OPENAI_AVAILABLE:
             return
         if message.author.bot:
@@ -173,11 +352,65 @@ class LLMChat(commands.Cog):
         if not user_text:
             user_text = "(no text — the user only pinged you)"
 
+        # ----------------------------------------------------------------
+        # Step 1: classify — does this message likely need history?
+        # ----------------------------------------------------------------
+        use_history = False
+        prompt_msg: Optional[discord.Message] = None
+
+        if cfg["context_messages"] > 0:
+            needs, reason = await self._needs_history(
+                user_text,
+                model=cfg["model"],
+                base_url=cfg["base_url"],
+                api_key=cfg["api_key"],
+            )
+
+            if needs:
+                # ------------------------------------------------------------
+                # Step 2: send the embed + buttons and wait for user response
+                # ------------------------------------------------------------
+                view = HistoryPromptView(author=message.author)
+
+                embed = _make_history_embed(
+                    title="📜 Should I check the conversation history?",
+                    description=(
+                        f"Your message seems to reference earlier context.\n"
+                        f"**Reason:** {reason}\n\n"
+                        f"Should I read the last **{cfg['context_messages']}** messages "
+                        f"to give a better answer?"
+                    ),
+                    color=discord.Color.blurple(),
+                    show_footer=True,
+                )
+
+                prompt_msg = await message.reply(embed=embed, view=view, mention_author=False)
+
+                # Blocks here until button press or timeout
+                use_history = await view.wait_for_response()
+
+                # If the view timed out (no button pressed), update the embed
+                if not view._event.is_set():
+                    timeout_embed = _make_history_embed(
+                        title="⏱️ No response — skipping history",
+                        description="Answering based only on your message.",
+                        color=discord.Color.greyple(),
+                        show_footer=False,
+                    )
+                    try:
+                        await prompt_msg.edit(embed=timeout_embed, view=view)
+                    except discord.HTTPException:
+                        pass
+
+        # ----------------------------------------------------------------
+        # Step 3: build the messages list and call the model
+        # ----------------------------------------------------------------
         messages = await self._build_messages(
             message,
             user_text,
             system_prompt=cfg["system_prompt"],
-            context_limit=cfg["context_messages"],
+            context_limit=cfg["context_messages"] if use_history else 0,
+            history_skipped=not use_history,
         )
 
         async with message.channel.typing():
@@ -194,21 +427,23 @@ class LLMChat(commands.Cog):
                 )
             except asyncio.TimeoutError:
                 await message.reply(
-                    "⏱️ The model took too long to respond. Try again or check your backend."
+                    "⏱️ The model took too long to respond. Try again or check your backend.",
+                    mention_author=False,
                 )
                 return
             except Exception as exc:
                 log.exception("LLM API call failed")
-                await message.reply(f"❌ Error calling the model: {exc}")
+                await message.reply(f"❌ Error calling the model: {exc}", mention_author=False)
                 return
 
+        # Always reply to the original message, not the prompt embed
         if len(reply) <= 2000:
-            await message.reply(reply)
+            await message.reply(reply, mention_author=False)
         else:
             chunks = [reply[i : i + 1990] for i in range(0, len(reply), 1990)]
             for i, chunk in enumerate(chunks):
                 if i == 0:
-                    await message.reply(chunk)
+                    await message.reply(chunk, mention_author=False)
                 else:
                     await message.channel.send(chunk)
 
@@ -218,6 +453,7 @@ class LLMChat(commands.Cog):
         user_text: str,
         system_prompt: str,
         context_limit: int,
+        history_skipped: bool = False,
     ) -> list:
         messages = [{"role": "system", "content": system_prompt}]
 
@@ -241,12 +477,23 @@ class LLMChat(commands.Cog):
                 else:
                     role = "user"
                     content = f"{msg.author.display_name}: {msg.content}"
+
                 if content:
                     messages.append({"role": role, "content": content})
 
-        # Build the final user message — pass image URLs directly (no base64 encoding).
-        # The OpenAI-compatible image_url format is supported by Ollama (llava, etc.),
-        # OpenAI, and OpenRouter without any extra processing.
+        elif history_skipped:
+            # Tell the model it has no prior context so it doesn't hallucinate references
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Note: The user's message is being answered without conversation history. "
+                        "Do not refer to or assume any prior context."
+                    ),
+                }
+            )
+
+        # Final user message — supports image attachments
         image_attachments = [
             a
             for a in trigger_message.attachments
@@ -297,13 +544,11 @@ class LLMChat(commands.Cog):
             base_url=base_url or None,
             api_key=api_key or "none",
         )
-
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
         )
-
         return response.choices[0].message.content.strip()
 
     # ------------------------------------------------------------------
@@ -319,8 +564,6 @@ class LLMChat(commands.Cog):
         In DMs (owner only): sets global defaults for all guilds.
         """
         await ctx.send_help()
-
-    # --- enable / disable / channels (guild-only) ---
 
     @llmchat.command(name="enable")
     async def llmchat_enable(
@@ -374,8 +617,6 @@ class LLMChat(commands.Cog):
             mentions.append(ch.mention if ch else f"<deleted channel {cid}>")
         await ctx.send(f"**Enabled channels:** {', '.join(mentions)}")
 
-    # --- model / baseurl / apikey / systemprompt / maxtokens / context ---
-
     @llmchat.command(name="model")
     async def llmchat_model(self, ctx: commands.Context, *, model: str):
         """
@@ -385,9 +626,9 @@ class LLMChat(commands.Cog):
         In DMs (owner): sets the global default for all guilds.
 
         Examples:
-          `[p]llmchat model llava`                <- Ollama (vision-capable)
-          `[p]llmchat model llama3`               <- Ollama (text only)
-          `[p]llmchat model gpt-4o`               <- OpenAI (vision + text)
+          `[p]llmchat model llava`                 <- Ollama (vision-capable)
+          `[p]llmchat model llama3`                <- Ollama (text only)
+          `[p]llmchat model gpt-4o`                <- OpenAI (vision + text)
           `[p]llmchat model mixtral-8x7b-instruct` <- OpenRouter
         """
         if not await self._check_dm_owner(ctx):
@@ -418,14 +659,17 @@ class LLMChat(commands.Cog):
             return
         if not await self._check_guild_admin(ctx):
             return
+
         if url and url.lower() == "clear":
             url = None
+
         if ctx.guild:
             await self.config.guild(ctx.guild).base_url.set(url)
             scope = "for this server"
         else:
             await self.config.base_url.set(url or DEFAULT_BASE_URL)
             scope = "globally"
+
         await ctx.send(
             f"✅ Base URL set to `{url}` {scope}."
             if url
@@ -439,7 +683,6 @@ class LLMChat(commands.Cog):
 
         In a server: overrides for this guild only.
         In DMs (owner): sets the global default.
-
         To clear: `[p]llmchat apikey clear`
         """
         if not await self._check_dm_owner(ctx):
@@ -462,10 +705,7 @@ class LLMChat(commands.Cog):
             await self.config.api_key.set(key or DEFAULT_API_KEY)
             scope = "globally"
 
-        if key:
-            await ctx.send(f"✅ API key saved {scope}.")
-        else:
-            await ctx.send(f"✅ API key cleared {scope}.")
+        await ctx.send(f"✅ API key saved {scope}." if key else f"✅ API key cleared {scope}.")
 
     @llmchat.command(name="systemprompt")
     async def llmchat_systemprompt(self, ctx: commands.Context, *, prompt: str):
@@ -479,12 +719,14 @@ class LLMChat(commands.Cog):
             return
         if not await self._check_guild_admin(ctx):
             return
+
         if ctx.guild:
             await self.config.guild(ctx.guild).system_prompt.set(prompt)
             scope = "for this server"
         else:
             await self.config.system_prompt.set(prompt)
             scope = "globally"
+
         await ctx.send(f"✅ System prompt updated {scope}:\n{box(prompt)}")
 
     @llmchat.command(name="maxtokens")
@@ -499,20 +741,26 @@ class LLMChat(commands.Cog):
             return
         if not await self._check_guild_admin(ctx):
             return
+
         if tokens < 64 or tokens > 8192:
             return await ctx.send("Please choose a value between 64 and 8192.")
+
         if ctx.guild:
             await self.config.guild(ctx.guild).max_tokens.set(tokens)
             scope = "for this server"
         else:
             await self.config.max_tokens.set(tokens)
             scope = "globally"
+
         await ctx.send(f"✅ Max tokens set to `{tokens}` {scope}.")
 
     @llmchat.command(name="context")
     async def llmchat_context(self, ctx: commands.Context, count: int):
         """
-        Set how many recent messages to include as context (0-50).
+        Set how many recent messages to include as context when history is needed (0-50).
+
+        History is only fetched when the classifier decides it will help AND the
+        user confirms via the embed prompt. Setting to 0 disables history entirely.
 
         In a server: overrides for this guild only.
         In DMs (owner): sets the global default.
@@ -521,17 +769,18 @@ class LLMChat(commands.Cog):
             return
         if not await self._check_guild_admin(ctx):
             return
+
         if count < 0 or count > 50:
             return await ctx.send("Please choose a value between 0 and 50.")
+
         if ctx.guild:
             await self.config.guild(ctx.guild).context_messages.set(count)
             scope = "for this server"
         else:
             await self.config.context_messages.set(count)
             scope = "globally"
-        await ctx.send(f"✅ Context window set to `{count}` messages {scope}.")
 
-    # --- settings / setup ---
+        await ctx.send(f"✅ Context window set to `{count}` messages {scope}.")
 
     @llmchat.command(name="settings")
     async def llmchat_settings(self, ctx: commands.Context):
@@ -569,18 +818,22 @@ class LLMChat(commands.Cog):
                 return f"`{guild_val}`"
 
             embed.description = "Showing guild overrides. Values marked _(global default)_ are inherited."
+            embed.add_field(name="Model", value=fmt(g["model"], eff["model"]), inline=True)
             embed.add_field(
-                name="Model", value=fmt(g["model"], eff["model"]), inline=True
+                name="Max Tokens", value=fmt(g["max_tokens"], eff["max_tokens"]), inline=True
             )
             embed.add_field(
-                name="Max Tokens",
-                value=fmt(g["max_tokens"], eff["max_tokens"]),
-                inline=True,
-            )
-            embed.add_field(
-                name="Context Messages",
+                name="Context Messages (max)",
                 value=fmt(g["context_messages"], eff["context_messages"]),
                 inline=True,
+            )
+            embed.add_field(
+                name="Smart History",
+                value=(
+                    f"✅ Classifier + **user confirmation embed**\n"
+                    f"Timeout: {HISTORY_PROMPT_TIMEOUT}s → skip history"
+                ),
+                inline=False,
             )
             embed.add_field(
                 name="Base URL", value=fmt(g["base_url"], eff["base_url"]), inline=False
@@ -600,9 +853,7 @@ class LLMChat(commands.Cog):
                 inline=False,
             )
             sp = g["system_prompt"] or glob["system_prompt"]
-            sp_label = "System Prompt" + (
-                "" if g["system_prompt"] else " _(global default)_"
-            )
+            sp_label = "System Prompt" + ("" if g["system_prompt"] else " _(global default)_")
             embed.add_field(
                 name=sp_label,
                 value=box(sp[:400] + ("..." if len(sp) > 400 else "")),
@@ -611,17 +862,19 @@ class LLMChat(commands.Cog):
         else:
             embed.description = "Global defaults — applied to any guild that hasn't set its own override."
             embed.add_field(name="Model", value=f"`{glob['model']}`", inline=True)
+            embed.add_field(name="Max Tokens", value=str(glob["max_tokens"]), inline=True)
             embed.add_field(
-                name="Max Tokens", value=str(glob["max_tokens"]), inline=True
+                name="Context Messages (max)", value=str(glob["context_messages"]), inline=True
             )
             embed.add_field(
-                name="Context Messages",
-                value=str(glob["context_messages"]),
-                inline=True,
+                name="Smart History",
+                value=(
+                    f"✅ Classifier + **user confirmation embed**\n"
+                    f"Timeout: {HISTORY_PROMPT_TIMEOUT}s → skip history"
+                ),
+                inline=False,
             )
-            embed.add_field(
-                name="Base URL", value=f"`{glob['base_url']}`", inline=False
-            )
+            embed.add_field(name="Base URL", value=f"`{glob['base_url']}`", inline=False)
             embed.add_field(
                 name="API Key",
                 value="✅ Set" if glob["api_key"] else "❌ Not set",
@@ -650,10 +903,14 @@ class LLMChat(commands.Cog):
             f"{p}llmchat apikey ollama\n```\n"
             "**Step 3 — enable in a channel (must be in the server):**\n"
             f"```\n{p}llmchat enable #your-channel\n```\n"
+            "**Smart history flow:**\n"
+            "1. A classifier call checks if your message likely needs conversation history.\n"
+            "2. If yes → the bot sends an embed with **📜 Yes** / **🚫 No** buttons.\n"
+            "3. Confirm → history is fetched and included. Decline (or ignore for 60s) → answered without it.\n\n"
             "**Vision/image support:** use a vision-capable model such as `llava` (Ollama) or `gpt-4o` (OpenAI).\n"
             "Text-only models like `llama3` will error if an image is sent.\n\n"
             "**Other backends:**\n"
-            f"OpenAI:     `{p}llmchat baseurl https://api.openai.com/v1`\n"
+            f"OpenAI: `{p}llmchat baseurl https://api.openai.com/v1`\n"
             f"OpenRouter: `{p}llmchat baseurl https://openrouter.ai/api/v1`\n\n"
             f"See settings: `{p}llmchat settings`"
         )
