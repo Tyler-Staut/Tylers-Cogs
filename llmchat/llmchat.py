@@ -413,7 +413,17 @@ class LLMChat(commands.Cog):
                     await message.channel.send(chunk)
 
     async def _build_messages(self, trigger_message, user_text, system_prompt, context_limit):
-        messages = [{"role": "system", "content": system_prompt}]
+        # Inject the author's display name into the system prompt as plain metadata.
+        # This keeps it completely separate from message content so the model cannot
+        # mistake a non-Latin username for spoken language or content to echo back.
+        author_name = trigger_message.author.display_name
+        system_with_author = (
+            f"{system_prompt}\n\n"
+            f"The user you are replying to has the username: {author_name}\n"
+            f"Always reply in the same language the user writes their message in, "
+            f"regardless of what their username looks like."
+        )
+        messages = [{"role": "system", "content": system_with_author}]
 
         if context_limit > 0:
             history = []
@@ -434,7 +444,9 @@ class LLMChat(commands.Cog):
                     content = msg.content
                 else:
                     role = "user"
-                    content = f"{msg.author.display_name}: {msg.content}"
+                    # Use plain message content only — no name prefix that could
+                    # confuse the model's language detection.
+                    content = msg.content
                 if content:
                     messages.append({"role": role, "content": content})
 
@@ -451,7 +463,7 @@ class LLMChat(commands.Cog):
             content_parts = [
                 {
                     "type": "text",
-                    "text": f"{trigger_message.author.display_name}: {user_text}",
+                    "text": user_text,  # plain text, no name prefix
                 }
             ]
             for attachment in image_attachments:
@@ -463,12 +475,7 @@ class LLMChat(commands.Cog):
                 )
             messages.append({"role": "user", "content": content_parts})
         else:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": f"{trigger_message.author.display_name}: {user_text}",
-                }
-            )
+            messages.append({"role": "user", "content": user_text})
 
         return messages
 
