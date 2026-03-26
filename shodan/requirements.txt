@@ -18,11 +18,11 @@ colorama==0.4.4
     # via shodan
 idna==3.7
     # via requests
-requests==2.32.4
+requests==2.33.0
     # via shodan
 shodan==1.27.0
     # via -r requirements.in
-urllib3==1.26.19
+urllib3==2.6.3
     # via requests
 xlsxwriter==3.0.3
     # via shodan
